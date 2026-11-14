@@ -66,12 +66,13 @@ from sm2_lingua import NOMI_EN, T, imposta as imposta_lingua, lingua as lingua_s
 import sm2_comandi  # noqa: E402  (0.12: controller e tasti del giocatore 1)
 import sm2_salvataggi  # noqa: E402  (0.12: memory card e salvataggi rapidi)
 
-VERSIONE = '0.12'
+VERSIONE = '0.13'
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / 'tools'
 CATALOGO = ROOT / 'aot' / 'sm2_versioni.json'
 PLACEMENTS = ROOT / 'aot' / 'sm2_placements.json'
 RENDERER = ROOT / 'aot' / 'sm2_renderer.json'
+PATCH_WIDESCREEN = ROOT / 'aot' / 'sm2_widescreen_patch.json'   # vista larga intera (12/11/2026, dalla decompilazione)
 INPUT = ROOT / 'input'
 GIOCHI = ROOT / 'giochi'
 TOOLCHAIN = TOOLS / 'toolchain' / 'cmake-clang-v1'
@@ -1513,6 +1514,24 @@ package = "sm2.enhancement.draw-distance"
 requires_feature = "packet-area"
 '''
 
+NOTA_PATCH_WIDESCREEN = '''
+# EnterElectro-Recomp (12/11/2026): "vista larga intera" per questa versione (aot/sm2_widescreen_patch.json, dalle
+# varianti della decompilazione): bande nere dei filmati del motore, tendina dei cambi di zona, dissolvenza, velo del
+# menu di pausa e piani di ritaglio laterali allargati alle proporzioni scelte, cosi' gli oggetti vicini alla telecamera
+# non si tagliano piu' al bordo 4:3 ("Adatta alla finestra" usa quelle del 21:9). Patch con guardia sull'eseguibile,
+# scritte dal launcher con i byte del disco dell'utente, solo con la mod accesa; con la mod spenta il gioco non cambia.
+# Le pagine cambiate le esegue la macchina dirty-RAM di psxrecomp, che le compila al volo.
+'''
+
+
+def manifesto_widescreen(area: bool, patch: str) -> str:
+    """Manifesto del pacchetto Widescreen: con l'area dei pacchetti piu' grande (formato 7, [[requirement]]) e con le
+    patch della vista larga intera, se ci sono per questa versione (patch_widescreen)."""
+    testo = MANIFESTO_WIDESCREEN
+    if area:
+        testo = testo.replace('format_version = 5', 'format_version = 7', 1) + REQUISITO_AREA
+    return testo + NOTA_PATCH_WIDESCREEN + patch if patch else testo
+
 # Punti di aggancio per la mod "Distanza visiva" nella sezione [recompiler] del game.toml, tra i segni.
 INIZIO_DISTANZA = '# >>> SM2-Recomp: mod "Distanza visiva"'
 FINE_DISTANZA = '# <<< SM2-Recomp: mod "Distanza visiva"'
@@ -1696,6 +1715,98 @@ def piani_renderer(prof: str, exe: bytes):
         return None, T(f'PianiX (0x{a:08X}): istruzioni diverse da quelle attese',
                        f'PianiX (0x{a:08X}): instructions different from the expected ones')
     return a, ''
+
+
+# Scelte dell'opzione "aspect" senza una serie di patch propria: "fit" (Adatta alla finestra, launcher 0.12) usa quella
+# del 21:9, la piu' larga (nelle finestre piu' strette le parti in piu' stanno fuori dallo schermo).
+ALIAS_PATCH_WIDESCREEN = {'fit': '21:9'}
+
+
+def patch_widescreen(prof: str, exe: bytes, scelte=None):
+    """Widescreen (12/11/2026): le patch della "vista larga intera" di aot/sm2_widescreen_patch.json (dalle varianti
+    della decompilazione, una serie per proporzione). Il file non contiene byte del gioco: per ogni zona l'impronta
+    SHA-256 dei byte originali e la differenza XOR; qui i byte originali si prendono dall'eseguibile del disco
+    dell'utente, si controlla l'impronta e si ricostruiscono i byte nuovi, che vanno nel manifesto dell'installazione.
+    Con scelte (insieme di valori dell'opzione "aspect") solo le patch di quelle proporzioni.
+    Restituisce (blocchi [[patch]] del manifesto, '') o ('', motivo)."""
+    try:
+        voce = json.loads(PATCH_WIDESCREEN.read_text(encoding='utf-8'))['versioni'].get(prof)
+    except (OSError, ValueError, KeyError) as e:
+        return '', T(f'{PATCH_WIDESCREEN.name} non leggibile ({e})', f'{PATCH_WIDESCREEN.name} cannot be read ({e})')
+    if not voce:
+        return '', T('non ancora disponibile per questa versione', 'not available yet for this version')
+    if hashlib.sha256(exe).hexdigest() != voce.get('exe_sha256'):
+        return '', T('eseguibile diverso da quello delle patch', 'executable different from the one of the patches')
+    carica = struct.unpack_from('<I', exe, 0x18)[0]
+    serie_per_scelta = dict(voce['aspect'])
+    for alias, sorgente in ALIAS_PATCH_WIDESCREEN.items():
+        if sorgente in serie_per_scelta and alias not in serie_per_scelta:
+            serie_per_scelta[alias] = serie_per_scelta[sorgente]
+    blocchi = []
+    try:
+        for aspetto, serie in serie_per_scelta.items():
+            if scelte is not None and aspetto not in scelte:
+                continue
+            for p in serie:
+                a, n, diff = int(p['address'], 16), int(p['size']), bytes.fromhex(p['xor'])
+                o = 0x800 + a - carica
+                atteso = exe[o:o + n] if 0x800 <= o and o + n <= len(exe) else b''
+                if a & 3 or n <= 0 or len(diff) != n or len(atteso) != n or \
+                        hashlib.sha256(atteso).hexdigest() != p['sha256']:
+                    return '', T(f'patch a 0x{a:08X} ({aspetto}): byte dell\'eseguibile diversi da quelli attesi',
+                                 f'patch at 0x{a:08X} ({aspetto}): executable bytes differ from the expected ones')
+                nuovo = bytes(x ^ y for x, y in zip(atteso, diff))
+                blocchi.append('\n[[patch]]\nfeature = "widescreen"\ntarget = "main_exe"\n'
+                               f'address = 0x{a:08X}\nexpected = "{atteso.hex(" ")}"\nreplace = "{nuovo.hex(" ")}"\n'
+                               f'when = {{ aspect = "{aspetto}" }}\n')
+    except (KeyError, TypeError, ValueError) as e:
+        return '', T(f'{PATCH_WIDESCREEN.name}: voce incompleta ({e})', f'{PATCH_WIDESCREEN.name}: incomplete entry ({e})')
+    nota = ''
+    if voce.get('mancano'):          # versione con solo una parte delle patch (porta_patch_versioni.py)
+        nomi = {'piani': ('oggetti vicini ai lati', 'close objects at the sides'), 'dissolvenza': ('dissolvenza', 'fades'),
+                'tendina': ('tendina', 'transition wipe'), 'velo': ('velo della pausa', 'pause veil'),
+                'bande': ('bande', 'bars')}
+        si = [nomi.get(x, (x, x)) for x in voce.get('parti', [])]
+        no = [nomi.get(x, (x, x)) for x in voce['mancano']]
+        nota = T('solo ' + ', '.join(a for a, _ in si) + '; non ' + ', '.join(a for a, _ in no),
+                 'only ' + ', '.join(b for _, b in si) + '; not ' + ', '.join(b for _, b in no))
+    return ''.join(blocchi), nota
+
+
+INIZIO_PATCH_WS = '"vista larga intera" per questa versione'     # nella prima riga di NOTA_PATCH_WIDESCREEN
+
+
+def aggiorna_manifesto_widescreen(cartella: Path, prof: str, exe_nome: str) -> str:
+    """Installazioni fatte prima della vista larga intera (12/11/2026): all'avvio aggiunge, o rinnova, le patch nel
+    manifesto del pacchetto Widescreen dell'installazione e nelle sue copie delle build (mods/bundled, quello che il
+    gioco legge), senza ricompilare. Il resto del manifesto resta quello installato e le patch sono solo per le
+    proporzioni che offre (un'installazione della 0.11 non ha "Adatta alla finestra"). Restituisce cosa ha cambiato
+    ('' se niente)."""
+    import tomllib
+    pacchetto = Path('mods') / 'preloaded' / 'packages' / MOD_WIDESCREEN[0] / '1.0.0' / 'manifest.toml'
+    sorgente, exe = cartella / pacchetto, cartella / 'disc' / exe_nome
+    if not sorgente.is_file() or not exe.is_file():
+        return ''
+    attuale = sorgente.read_text(encoding='utf-8')
+    i = attuale.find(INIZIO_PATCH_WS)
+    base = attuale[:attuale.rfind('\n', 0, i)] if i >= 0 else attuale
+    try:
+        d = tomllib.loads(base)
+    except tomllib.TOMLDecodeError as e:
+        return T(f'avviso: manifesto del widescreen non leggibile ({e})', f'warning: widescreen manifest cannot be read ({e})')
+    scelte = {c.get('value') for o in d.get('option', []) if o.get('id') == 'aspect' for c in o.get('choice', [])}
+    patch, _ = patch_widescreen(prof, exe.read_bytes(), scelte)
+    nuovo = base + NOTA_PATCH_WIDESCREEN + patch if patch else base
+    copie = [cartella / b / 'mods' / 'bundled' / MOD_WIDESCREEN[0] / '1.0.0' / 'manifest.toml'
+             for b in ('build-release', 'build-dev')]
+    cambiati = sum(1 for p in [sorgente] + copie if p.is_file() and scrivi_se_diverso(p, nuovo))
+    if not cambiati:
+        return ''
+    if patch:
+        return T(f'mod "Widescreen": vista larga intera aggiunta senza ricompilare ({cambiati} manifesti)',
+                 f'"Widescreen" mod: full wide view added without rebuilding ({cambiati} manifests)')
+    return T(f'mod "Widescreen": vista larga intera tolta ({cambiati} manifesti)',
+             f'"Widescreen" mod: full wide view removed ({cambiati} manifests)')
 
 
 GAME_OPTIONS = '''# Native in-game OPTION persistence (optional).
@@ -2248,6 +2359,21 @@ class Installazione:
         entry = struct.unpack_from('<I', dati, 0x10)[0]
         scrivi_se_diverso(base / 'symbols.toml', SYMBOLS.replace('@NOME@', self.v['nome'])
                           .replace('@PROFILO@', self.prof).replace('@ENTRY@', f'{entry:08X}'))
+        # mod "Widescreen": la vista larga intera (bande, tendina, dissolvenza, velo della pausa, piani di ritaglio)
+        # come patch con guardia, se ci sono per questa versione; distanza() riscrive il manifesto con l'area
+        self.patch_ws, motivo_ws = patch_widescreen(self.prof, dati)
+        scrivi_se_diverso(pacchetto / 'manifest.toml', manifesto_widescreen(False, self.patch_ws))
+        if self.patch_ws and motivo_ws:
+            log(T(f'  mod "Widescreen": vista larga intera in parte, per questa versione ({motivo_ws})',
+                  f'  "Widescreen" mod: part of the full wide view for this version ({motivo_ws})'))
+        elif self.patch_ws:
+            log(T('  mod "Widescreen": vista larga intera (tendina, velo della pausa, oggetti vicini ai lati senza '
+                  'tagli; bande e dissolvenza nel codice) per 16:9, 16:10, 21:9 e "Adatta alla finestra"',
+                  '  "Widescreen" mod: full wide view (transition wipe, pause veil, close objects at the sides not cut '
+                  'off; bars and fades in the code) for 16:9, 16:10, 21:9 and "Fit to window"'))
+        else:
+            log(T(f'  mod "Widescreen": vista larga intera non disponibile ({motivo_ws})',
+                  f'  "Widescreen" mod: full wide view not available ({motivo_ws})'))
         self.distanza(dati)
         self.attese_trovate(dati)
         log(T(f'  progetto pronto: eseguibile {self.exe}, entry 0x{entry:08X}',
@@ -2341,8 +2467,7 @@ class Installazione:
         # launcher v0.11: con l'area piu' grande, il widescreen la accende per la sessione ([[requirement]], formato 7)
         man_ws = base / 'mods' / 'preloaded' / 'packages' / 'sm2.enhancement.widescreen' / '1.0.0' / 'manifest.toml'
         if man_ws.parent.is_dir():
-            scrivi_se_diverso(man_ws, MANIFESTO_WIDESCREEN.replace('format_version = 5', 'format_version = 7', 1)
-                              + REQUISITO_AREA if link else MANIFESTO_WIDESCREEN)
+            scrivi_se_diverso(man_ws, manifesto_widescreen(bool(link), getattr(self, 'patch_ws', '')))
         funzioni = ['FogPc', 'SubmitPc'] + (['SwapPc', 'LimitPc'] if link else [])
         istruzioni = [h['PrecisionPc']]
         if link:                         # area dei pacchetti piu' grande: i 3 punti della lunghezza dei pacchetti
@@ -2961,6 +3086,11 @@ ESCLUSI_MOTORE = {'.git', '.github', '.cache', '__pycache__', 'tests', 'docs', '
 # installazione cambierebbe l'impronta del motore a meta' strada (la traduzione, fatta prima, non si saltava alla prima
 # reinstallazione).
 GENERATI_MOTORE = {'psxrecomp/runtime/include/overlay_codegen_hash.h'}
+# Dati del launcher che stanno in aot/ ma non cambiano quello che "installa" compila (0.13, 13/11/2026): le patch della
+# vista larga intera si rinnovano a ogni avvio nel manifesto Widescreen dell'installazione (aggiorna_manifesto_widescreen),
+# quindi non contano nel motore. Con questo file escluso il motore della 0.13 e' quello della 0.12 e le installazioni
+# della 0.12 non si reinstallano.
+DATI_NON_MOTORE = {'aot/sm2_widescreen_patch.json'}
 
 
 def impronta_motore() -> dict:
@@ -2977,7 +3107,7 @@ def impronta_motore() -> dict:
             for n in sorted(nomi):
                 f = Path(cart) / n
                 rel = f.relative_to(ROOT).as_posix()
-                if rel in GENERATI_MOTORE:
+                if rel in GENERATI_MOTORE or rel in DATI_NON_MOTORE:
                     continue
                 st = f.stat()
                 voci.append((rel, st.st_size, st.st_mtime_ns))
@@ -3325,6 +3455,13 @@ def cmd_avvia(args) -> int:
             cambiato = aggiorna_toml_widescreen(cartella / 'game.toml')
         except OSError as e:
             cambiato = T(f'avviso: game.toml non aggiornato ({e})', f'warning: game.toml not updated ({e})')
+        if cambiato:
+            log(cambiato)
+        try:                         # 12/11/2026: la vista larga intera arriva anche senza reinstallare
+            cambiato = aggiorna_manifesto_widescreen(cartella, prof, cat[prof]['exe'])
+        except (OSError, ValueError, KeyError) as e:
+            cambiato = T(f'avviso: manifesto del widescreen non aggiornato ({e})',
+                         f'warning: widescreen manifest not updated ({e})')
         if cambiato:
             log(cambiato)
     cmd = [str(exe), '--game', str(cartella / 'game.toml'), '--disc', str(cue)]

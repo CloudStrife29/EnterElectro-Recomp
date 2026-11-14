@@ -91,7 +91,16 @@ if errorlevel 1 (
   goto :fine
 )
 :pronto
+rem Con la code page UTF-8 (65001) cmd legge male env.bat del toolchain (a capo LF e un carattere non ASCII): lo
+rem si chiama con la code page 437 e poi si rimette la 65001. English: with the UTF-8 code page (65001) cmd misreads
+rem the toolchain env.bat (LF line endings, one non-ASCII character): it is called with code page 437, then 65001
+rem is restored.
+set "SM2_CP="
+for /f "tokens=2 delims=:." %%a in ('chcp') do set "SM2_CP=%%a"
+if defined SM2_CP set "SM2_CP=%SM2_CP: =%"
+if "%SM2_CP%"=="65001" chcp 437 >nul
 call "%TCDIR%\env.bat"
+if "%SM2_CP%"=="65001" chcp 65001 >nul
 python tools\sm2_launcher.py %*
 set "CODICE=%ERRORLEVEL%"
 :fine
